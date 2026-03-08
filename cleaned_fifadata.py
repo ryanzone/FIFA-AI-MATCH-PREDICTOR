@@ -1,70 +1,113 @@
+"""
+Clean all FIFA datasets in FIFA_DATA/ and save to FIFA_DATA/cleaned/.
+Handles both detailed (FIFA17-22, 63+ cols) and compact (FIFA23, 29 cols) formats.
+"""
 import pandas as pd
+import os
 
-print("Loading datasets...")
+RAW_DIR = os.path.join(os.path.dirname(__file__), "FIFA_DATA")
+OUT_DIR = os.path.join(RAW_DIR, "cleaned")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# Load the datasets
-matches_df = pd.read_csv("matches.csv")
-players_21_df = pd.read_csv("players_21.csv")
-players_22_df = pd.read_csv("players_22.csv")
+# Columns to drop (URL/image related)
+DROP_PATTERNS = ["photo", "flag", "logo", "url", "face"]
 
-print("Initial checks:")
-print(matches_df.info())
-print(players_21_df.info())
-print(players_22_df.info())
 
-print("\nCleaning matches.csv...")
+def clean_player_file(path, year):
+    print(f"  Loading FIFA{year}...")
+    df = pd.read_csv(path, low_memory=False)
 
-# Clean matches.csv
-matches_cleaned = matches_df.copy()
-
-# Drop unnecessary columns
-matches_cleaned.drop(columns=["Unnamed: 0", "notes"], inplace=True, errors='ignore')
-
-# Convert 'date' and 'time' to datetime
-matches_cleaned["date"] = pd.to_datetime(matches_cleaned["date"], errors='coerce')
-matches_cleaned["time"] = pd.to_datetime(matches_cleaned["time"], format='%H:%M', errors='coerce').dt.time
-
-# Fill missing attendance with median
-matches_cleaned["attendance"].fillna(matches_cleaned["attendance"].median(), inplace=True)
-
-# Fill missing distance with mean
-matches_cleaned["dist"].fillna(matches_cleaned["dist"].mean(), inplace=True)
-
-print("matches.csv cleaned ✅")
-
-print("\nCleaning players_21.csv and players_22.csv...")
-
-# Cleaning function
-def clean_players(df):
-    df_cleaned = df.copy()
-
-    # Drop URL/logo-related columns and extras
-    cols_to_drop = [col for col in df_cleaned.columns if "url" in col.lower()]
-    extra_cols = ['player_face_url', 'club_logo_url', 'nation_logo_url', 'team_jersey_number']
-    cols_to_drop += [col for col in extra_cols if col in df_cleaned.columns]
-    df_cleaned.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+    # Drop image/URL columns
+    drop_cols = [c for c in df.columns if any(p in c.lower() for p in DROP_PATTERNS)]
+    df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
     # Remove duplicates
-    df_cleaned.drop_duplicates(inplace=True)
+    df.drop_duplicates(inplace=True)
 
-    # Clean position rating columns (like "52+3") into numbers
-    for col in df_cleaned.select_dtypes(include="object"):
-        if df_cleaned[col].astype(str).str.contains(r"\+\d+", na=False).any():
-            df_cleaned[col] = df_cleaned[col].str.extract(r"(\d+)").astype(float)
+    # Parse Value/Wage strings like "€110.5M" or "€220K" → numeric
+    for col in ["Value", "Wage", "Release Clause"]:
+        if col in df.columns and df[col].dtype == object:
+            df[col] = (
+                df[col]
+                .str.replace("€", "", regex=False)
+                .str.replace(",", "", regex=False)
+                .apply(_parse_money)
+            )
 
-    return df_cleaned
+    # Parse Height (e.g. "5'11" or "180cm") → cm
+    if "Height" in df.columns and df["Height"].dtype == object:
+        df["Height"] = df["Height"].apply(_parse_height)
 
-# Clean both player files
-players_21_cleaned = clean_players(players_21_df)
-players_22_cleaned = clean_players(players_22_df)
+    # Parse Weight (e.g. "154lbs" or "70kg") → kg
+    if "Weight" in df.columns and df["Weight"].dtype == object:
+        df["Weight"] = df["Weight"].apply(_parse_weight)
 
-print("players_21.csv and players_22.csv cleaned ✅")
+    # Clean position rating strings like "82+3" → 82
+    for col in df.select_dtypes(include="object"):
+        if df[col].astype(str).str.contains(r"\+\d+", na=False).any():
+            df[col] = df[col].str.extract(r"(\d+)").astype(float)
 
-print("\nSaving cleaned files...")
+    # Add year column for identification
+    df["fifa_year"] = year
 
-# Save cleaned CSVs
-matches_cleaned.to_csv("matches_cleaned.csv", index=False)
-players_21_cleaned.to_csv("players_21_cleaned.csv", index=False)
-players_22_cleaned.to_csv("players_22_cleaned.csv", index=False)
+    out = os.path.join(OUT_DIR, f"fifa{year}_cleaned.csv")
+    df.to_csv(out, index=False)
+    print(f"  ✅ Saved → {out} ({len(df)} rows, {len(df.columns)} cols)")
+    return df
 
-print("All cleaned files saved successfully ✅")
+
+def _parse_money(val):
+    if pd.isna(val) or val == "" or val == "0":
+        return 0
+    val = str(val).strip()
+    try:
+        if val.endswith("M"):
+            return float(val[:-1]) * 1_000_000
+        elif val.endswith("K"):
+            return float(val[:-1]) * 1_000
+        return float(val)
+    except ValueError:
+        return 0
+
+
+def _parse_height(val):
+    if pd.isna(val):
+        return None
+    val = str(val).strip()
+    if "cm" in val:
+        return float(val.replace("cm", ""))
+    if "'" in val:
+        parts = val.replace('"', '').split("'")
+        try:
+            return round(float(parts[0]) * 30.48 + float(parts[1] if parts[1] else 0) * 2.54)
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _parse_weight(val):
+    if pd.isna(val):
+        return None
+    val = str(val).strip()
+    if "kg" in val:
+        return float(val.replace("kg", ""))
+    if "lbs" in val:
+        return round(float(val.replace("lbs", "")) * 0.4536, 1)
+    return None
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("FIFA Data Cleaning Pipeline")
+    print("=" * 50)
+
+    files = sorted(
+        [f for f in os.listdir(RAW_DIR) if f.endswith(".csv") and "official" in f.lower()]
+    )
+    print(f"Found {len(files)} datasets\n")
+
+    for f in files:
+        year = f.replace("FIFA", "").replace("_official_data.csv", "")
+        clean_player_file(os.path.join(RAW_DIR, f), year)
+
+    print("\n✅ All datasets cleaned and saved to FIFA_DATA/cleaned/")
